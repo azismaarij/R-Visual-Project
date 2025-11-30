@@ -1,0 +1,738 @@
+
+---
+title: 'Mapping Spatial Income in Sweden'
+subtitle: 'Visualizing DeSO-level differences in average net income (2023) and gender disparities across regions.'
+author: "Azis Maarij Jamil"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: '3'
+    number_sections: true
+    fig_caption: true
+  html_document:
+    toc: true
+    toc_depth: 3
+    df_print: paged
+header-includes:
+  - \usepackage{float}          # enables [H] figure placement
+  - \usepackage[section]{placeins} # stops floats from crossing sections
+params:
+  deso_gpkg_path: "/Users/azisjamil/Documents/Master/DABN 19 - Data Viz/Assignments/Project/DeSO_2025.gpkg"
+  lund_kommun_kod: '1281'
+  start_year: 2013
+  end_year: 2023
+  simplify_tolerance: 50
+---
+
+
+```{r setup, include = FALSE}
+# Setup options for R Markdown
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE, fig.align = "center",
+  fig.width = 6, fig.height = 4, fig.pos = "H"
+)
+
+
+library(sf)
+library(dplyr)
+library(ggplot2)
+library(scales)
+library(colorspace)
+library(patchwork)
+library(stringr)
+
+sf::sf_use_s2(FALSE)  # simpler topology for unions/simplify
+
+
+YEAR_TO <- 2023  # (from params)
+YEAR_FROM <- 2013  # (from params)
+deso_gpkg_path <- '/Users/azisjamil/Documents/Master/DABN 19 - Data Viz/Assignments/Project/DeSO_2025.gpkg' 
+TOL <- 50
+
+```
+
+```{r, echo = FALSE}
+
+
+deso <- st_read(deso_gpkg_path, quiet = TRUE)
+
+# 1) If geometry isn't set, set it from 'sp_geometry' when present
+if (is.null(sf::st_geometry(deso)) && "sp_geometry" %in% names(deso)) {
+  sf::st_geometry(deso) <- deso$sp_geometry
+}
+
+# 2) Ensure CRS
+if (is.na(sf::st_crs(deso))) sf::st_crs(deso) <- 3006  # SWEREF99 TM
+
+# 3) Standardize the geometry column name to 'geometry'
+geom_col <- attr(deso, "sf_column")
+if (!identical(geom_col, "geometry")) {
+  names(deso)[names(deso) == geom_col] <- "geometry"
+  sf::st_geometry(deso) <- "geometry"
+}
+
+# Keep essential columns (geometry is kept implicitly)
+keep <- c("desokod","regsokod","lanskod","kommunkod","kommunnamn","version")
+keep <- keep[keep %in% names(deso)]
+deso <- dplyr::select(deso, dplyr::any_of(keep))
+
+# ✅ Transform and simplify geometry here
+deso_3006      <- sf::st_transform(deso, 3006)
+deso_3006_simpl<- sf::st_simplify(deso_3006, dTolerance = TOL, preserveTopology = TRUE)
+
+# Optional: WGS84 version for visualization
+deso_wgs       <- sf::st_transform(deso_3006_simpl, 4326)
+```
+
+
+```{r, echo=FALSE}
+# 0) Read metadata and helper
+endpoint <- "https://api.scb.se/OV0104/v1/doris/en/ssd/START/HE/HE0110/HE0110I/Tab2InkDesoN"
+meta <- pxweb::pxweb_get(endpoint)
+
+# Helper you defined above:
+get_var <- function(meta, code){ i <- which(vapply(meta$variables, `[[`, character(1), "code") == code); meta$variables[[i]] }
+
+v_region   <- get_var(meta, "Region")
+v_comp     <- get_var(meta, "Inkomstkomponenter")
+v_sex      <- get_var(meta, "Kon")
+v_cc       <- get_var(meta, "ContentsCode")
+v_tid      <- get_var(meta, "Tid")
+
+# Codes we need
+comp_net   <- "240"        # net income
+cc_mean_tk <- "000005FW"   # Mean value, SEK thousands
+sex_codes  <- c("1","2","1+2")
+
+years_want <- as.character(seq(YEAR_FROM, YEAR_TO))
+stopifnot(all(years_want %in% v_tid$values))
+
+# 1) Query (all DeSO, net income, men/women/total, mean (tkr), 2011–YEAR_TO)
+qry <- list(
+  "Region"               = "*",          # all DeSO
+  "Inkomstkomponenter"   = comp_net,     # 240
+  "Kon"                  = sex_codes,    # 1,2,1+2
+  "ContentsCode"         = cc_mean_tk,   # mean value, tkr
+  "Tid"                  = years_want
+)
+
+raw <- pxweb::pxweb_advanced_get(endpoint, query = qry, verbose = FALSE) |>
+  as.data.frame(stringsAsFactors = FALSE)
+
+# 2) Clean to a tidy long table (robust column resolution)
+nm  <- names(raw); nml <- tolower(nm)
+
+# Identify columns by metadata text (works even if headers are localized)
+col_region <- nm[ nml %in% tolower(c(get_var(meta,"Region")$text, "region")) ]
+col_sex    <- nm[ nml %in% tolower(c(get_var(meta,"Kon")$text,    "sex","kon")) ]
+col_time   <- nm[ nml %in% tolower(c(get_var(meta,"Tid")$text,    "year","tid")) ]
+
+# Identify the income-component ("Inkomstkomponenter" / "type of income") column
+col_comp   <- nm[ nml %in% tolower(c(get_var(meta,"Inkomstkomponenter")$text,
+                                      "inkomstkomponenter","type of income")) ]
+
+# Candidate observation columns = everything else
+cand_obs   <- setdiff(nm, c(col_region, col_sex, col_time, col_comp))
+
+# If multiple candidates, pick the one that looks most numeric after stripping spaces
+pick_numeric_obs <- function(df, cols){
+  scores <- sapply(cols, function(cc){
+    v <- suppressWarnings(as.numeric(gsub("\\s","", df[[cc]])))
+    sum(!is.na(v))
+  })
+  cols[ which.max(scores) ]
+}
+col_value <- if (length(cand_obs) == 1) cand_obs else pick_numeric_obs(raw, cand_obs)
+
+# Safety checks
+stopifnot(length(col_region) == 1L, length(col_sex) == 1L,
+          length(col_time) == 1L,   length(col_comp) == 1L,
+          length(col_value) == 1L)
+
+# Now build the tidy table
+deso_income <- raw |>
+  transmute(
+    desokod   = stringr::str_trim(.data[[col_region]]),
+    sex_raw   = .data[[col_sex]],
+    sex       = dplyr::recode(tolower(sex_raw),
+                              "1"="men","2"="women","1+2"="total",
+                              "men"="men","women"="women","total"="total"),
+    year      = suppressWarnings(as.integer(.data[[col_time]])),
+    comp_raw  = .data[[col_comp]],
+    net_tkr   = suppressWarnings(as.numeric(gsub("\\s","", .data[[col_value]]))),
+    net_sek   = net_tkr * 1000
+  )
+
+
+
+
+
+
+
+# 1) Build 2023 nationwide DeSO layer with net income (SEK)
+deso_all_2023_viz <- deso_3006_simpl %>%
+  left_join(
+    deso_income %>%
+      mutate(net_sek = if ("net_sek" %in% names(.)) net_sek else net_tkr*1000) %>%
+      filter(year == YEAR_TO, sex %in% c("total","1+2","Total","total")) %>%   # sex = total
+      select(desokod, net_sek),
+    by = "desokod"
+  ) %>%
+  st_transform(4326)
+
+bg_dark <- "#0F0F0F"
+border  <- "#202020"
+
+qbreaks <- quantile(deso_all_2023_viz$net_sek, probs = seq(0,1,0.1), na.rm = TRUE)
+
+fill_scale_common <- scale_fill_stepsn(
+  colours = colorspace::divergingx_hcl(10, palette = "PiYG"),  # magenta<->green
+  breaks  = qbreaks,
+  limits  = range(deso_all_2023_viz$net_sek, na.rm = TRUE),
+  labels  = label_number(big.mark = " "),
+  guide   = guide_colorbar(title.position = "top"),
+  na.value = "grey30"
+)
+
+map_theme <- theme_void() +
+  theme(
+    plot.background  = element_rect(fill = bg_dark, colour = NA),
+    panel.background = element_rect(fill = bg_dark, colour = NA),
+    plot.title       = element_text(size = 18, face = "bold", colour = "white", hjust = 0.5),
+    plot.subtitle    = element_text(colour = "grey80", size = 10, hjust = 0.5),
+    plot.caption     = element_text(colour = "grey70", size = 9, hjust = 0.5),
+    legend.position  = "bottom",
+    legend.key.width = unit(2.8, "cm"),
+    legend.title     = element_text(colour = "white"),
+    legend.text      = element_text(colour = "grey80")
+  )
+```
+
+\pagebreak
+
+# Overview
+Sweden has a well-established open data ecosystem. Once you are registered with the Swedish Tax Agency (Skatteverket), your details will be stored and openly available (you can try to google it). This level of transparency might feel surprising, but it shows how open-data culture look like, maybe to the extreme. While exploring my own data, I discovered that income information is available down to the neighbourhood level, showing the average income for each area. Then it occur to me the average income data is openly available.
+
+![Screenshot from https://mrkoll.se/ of one of neighbourhood in Lund](/Users/azisjamil/Documents/Master/DABN 19 - Data Viz/Assignments/Project/mrkroll.png)
+
+
+Sweden’s open-data ecosystem by SCB, the Sweden’s Statistics makes location-based analysis possible. In this project we use DeSO (Demografiska statistikområden) to explore the average net income. DeSO is a nationwide area classification that devides Sweden into ~5984 areas with around 700 and 2700 inhabitants at the start.The division follows the county and municipal boundaries.
+
+## Main Questions
+
+Using the dataset we are trying to explore the data by following the question below:
+
+- How does average net income vary across Sweden?
+- Which places have the highest average income?
+- Within large cities, do inner-city areas differ from surrounding suburbs?
+- By gender, are there systematic income differences?
+
+## Data Description
+
+**Data Sources**
+
+1. **Income per DeSO (SCB PxWeb)**  
+   API endpoint:  
+   `https://api.scb.se/OV0104/v1/doris/en/ssd/START/HE/HE0110/HE0110I/Tab2InkDesoN`  
+
+   **Dimensions used:**
+   - `Region` — DeSO code (geographical identifier)  
+   - `Inkomstkomponenter` — income component (we use `240 = net income`)  
+   - `Kon` — sex (`1 = men`, `2 = women`, `1+2 = total`)  
+   - `ContentsCode` — observation type (we use *Mean value, SEK thousands*)  
+   - `Tid` — year (2011–2023)
+
+*Note: The net income in the data is using the mean income data instead of median per DeSO. Hence, it need to be careful when taking the conclusions.*
+
+
+
+| Column | Description |
+|:--|:--|
+| `desokod` | DeSO code (unique area identifier) |
+| `year` | Observation year (2011–2023) |
+| `sex` | Gender category: *men*, *women*, *total* |
+| `income_component` | Type of income (e.g., wage, capital, net) |
+| `value_tkr` | Mean income value in **thousands SEK** |
+| `net_sek` | Yearly. Converted mean income value in **SEK** (`value_tkr * 1000`) |
+
+Table: **Structure of the Income per DeSO Dataset**
+
+2. **DeSO Geodata (polygon boundaries)**  
+   Source: *Statistics Sweden (SCB) Open Geodata – DeSO boundaries (GPKG)*  
+   Coordinate system: **SWEREF99 TM (EPSG:3006)**  
+   Reprojected to **WGS84 (EPSG:4326)** for mapping.
+
+
+Each DeSO (Demographic Statistical Area) code in Sweden is composed of nine characters, which together specify the county, municipality, and detailed sub-area classification.  
+
+Example **`1281C1440`** (Lund):
+
+| **Code Segment** | **Meaning** | **Description** |
+|------------------:|:------------|:----------------|
+| **1281** | **County and Municipality Code** | The first four digits represent the administrative location.<br>`12` = *Skåne County* and `81` = *Lund Municipality*. |
+| **C** | **Area Category** | The fifth character indicates the **type of area**:<br>• **A** = rural or sparsely populated area (outside major population clusters)<br>• **B** = suburban or non-central urban area<br>• **C** = central urban area (typically the municipality’s main city center).<br>In this case, **`C`** shows that the DeSO lies **within Lund’s central urban area**. |
+| **144** | **Sequential Number** | The next three digits are a **geographic sequence number**, ordering DeSO areas roughly **from south to north** within the same municipality and category. |
+| **0** | **Reserve Digit** | The final position is a **reserved slot** for future use — it allows a DeSO to be split if necessary, ensuring each code remains unique. |
+
+Table: **Desokod Breakdown Explanation**
+
+
+
+
+| Column | Description |
+|:--|:--|
+| `desokod` | DeSO identifier (key to join with income data) |
+| `kommunkod` | Municipality code |
+| `kommunnamn` | Municipality name |
+| `lanskod` | County code |
+| `regsokod` | Regional code |
+| `version` | Data version number |
+| `geometry` | Polygon geometry representing DeSO boundaries |
+
+Table: **DeSO Geodata Dataset**
+
+
+The two datasets are coming from two different sources. The datasets were joined using `desokod` as the key from both sources. The result from the joined table is the net income per DeSO in year 2023 (latest data provided).
+
+---
+
+\pagebreak
+
+# Analysis
+
+Below, each chart visualizes a different dimension of income distribution across Sweden’s regions and demographics.
+
+## Chart 1 — National map of net income by DeSO (2023)
+
+```{r ,echo = FALSE, fig.cap="National map of net income by DeSO (2023). The color shows the average income bin" , fig.height = 6.2}
+# Chart 1 — cleaner legend, using “k” units
+
+library(ggrepel)
+
+p_caption <- "Source: Statistics Sweden (SCB)"
+
+# palette + limits (same as before)
+pal_income <- colorspace::divergingx_hcl(11, palette = "RdYlBu", rev = TRUE)
+lim2 <- quantile(deso_all_2023_viz$net_sek, c(0.02, 0.98), na.rm = TRUE)
+
+# ✅ updated legend section
+fill_income <- scale_fill_stepsn(
+  colours  = pal_income,
+  limits   = lim2,
+  oob      = scales::squish,
+  n.breaks = 9,
+  labels   = scales::label_number(scale = 1/1000, suffix = "k"),  # e.g. 400k
+  guide    = guide_colorbar(
+    title.position = "top",
+    barwidth = unit(9, "cm"),      # narrower legend bar
+    barheight = unit(0.2, "cm"),   # smaller height
+    title.hjust = 0.5
+  ),
+  na.value = "grey30",
+  name     = "Average net income (SEK)"
+)
+
+# city coordinates (correct positions)
+cities <- tibble::tribble(
+  ~lon,     ~lat,     ~name,        ~nudge_x, ~nudge_y,
+  18.0686,  59.3293,  "Stockholm",   0.20,     0.00,
+  11.9746,  57.7089,  "Gothenburg",  0.20,     0.00,
+  13.0038,  55.6050,  "Malmö",       0.20,     0.00
+)
+
+bg_dark <- "#000000"; border <- "#202020"
+
+map_theme_full <- theme_void() +
+  theme(
+    plot.background  = element_rect(fill = bg_dark, colour = NA),
+    panel.background = element_rect(fill = bg_dark, colour = NA),
+    legend.position  = "bottom",
+    legend.title     = element_text(colour = "white", size = 8.5),
+    legend.text      = element_text(colour = "grey85", size = 7),
+    plot.caption     = element_text(colour = "grey75", size = 8),
+    plot.margin      = margin(16, 28, 10, 28)
+  )
+
+p_sweden_final <- ggplot(deso_all_2023_viz) +
+  geom_rect(aes(xmin=-Inf, xmax=Inf, ymin=-Inf, ymax=Inf),
+            fill=bg_dark, colour=NA) +
+  geom_sf(aes(fill = net_sek), colour = border, linewidth = 0.08) +
+  coord_sf(expand = TRUE, datum = NA, clip = "off") +
+  fill_income +
+  geom_point(data = cities, aes(lon, lat),
+             shape = 21, stroke = 0.2, size = 2.2,
+             fill = "white", colour = "black") +
+  geom_label_repel(
+    data = cities,
+    aes(lon, lat, label = name), 
+    seed = 42, size = 2.5,
+    label.size = 0.2, label.padding = unit(1.2, "pt"),
+    fill = alpha("black", 0.55), colour = "white",
+    min.segment.length = 0, segment.alpha = 0.5,
+    segment.size = 0.25, box.padding = 0.1, point.padding = 0.05,
+    nudge_x = cities$nudge_x, nudge_y = cities$nudge_y
+  ) +
+  map_theme_full
+
+p_sweden_final
+```
+
+The figure above is a decile-binned chloropeth which showing the average net income per person across all DeSO in Sweden in 2023. The different color in the chart showing the pattern or cluster of net income by the net income average bucket.
+
+The benefit of using DeSO income data on maps is it able to show the location based pattern more granular. As we can see from the figure above we can see some high-income clusters around Stockholm, Gothenburg, and Skåne. While, the lower income areas are appear in inland and northern regions.
+
+The map shows the wealth distribution in Sweden is more concentrated in large urban and coastal areas..
+
+
+---
+
+## Chart 2 — Which City Has the Highest Income (2023)
+
+
+```{r , echo = FALSE, fig.cap="Swarm of DeSO values per province. Median is diamond and Mean is circle of each provinnce income. Outliers excluded by only showing 1–99% percentile", fig.height=5}
+
+library(ggbeeswarm)
+library(forcats)
+
+# 1) province (län) lookup (reuse if already defined)
+lan_lookup <- deso_all_2023_viz %>%
+  sf::st_drop_geometry() %>%
+  group_by(lanskod) %>%
+  summarise(.groups = "drop") %>%
+  mutate(province = case_when(
+    lanskod == "01" ~ "Stockholm",
+    lanskod == "03" ~ "Uppsala",
+    lanskod == "04" ~ "Södermanland",
+    lanskod == "05" ~ "Östergötland",
+    lanskod == "06" ~ "Jönköping",
+    lanskod == "07" ~ "Kronoberg",
+    lanskod == "08" ~ "Kalmar",
+    lanskod == "09" ~ "Gotland",
+    lanskod == "10" ~ "Blekinge",
+    lanskod == "12" ~ "Skåne",
+    lanskod == "13" ~ "Halland",
+    lanskod == "14" ~ "Västra Götaland",
+    lanskod == "17" ~ "Värmland",
+    lanskod == "18" ~ "Örebro",
+    lanskod == "19" ~ "Västmanland",
+    lanskod == "20" ~ "Dalarna",
+    lanskod == "21" ~ "Gävleborg",
+    lanskod == "22" ~ "Västernorrland",
+    lanskod == "23" ~ "Jämtland",
+    lanskod == "24" ~ "Västerbotten",
+    lanskod == "25" ~ "Norrbotten",
+    TRUE ~ paste("Län", lanskod)
+  ))
+
+# 2) DeSO-level income with province, latest year
+deso_2023 <- deso_all_2023_viz %>%
+  sf::st_drop_geometry() %>%
+  left_join(lan_lookup, by = "lanskod") %>%
+  filter(!is.na(net_sek))
+
+# 3) consistent province order by median
+prov_order <- deso_2023 %>%
+  group_by(province) %>%
+  summarise(median = median(net_sek, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(median)) %>% pull(province)
+
+deso_2023 <- deso_2023 %>%
+  mutate(province = factor(province, levels = prov_order))
+
+# 4) summary points (median + mean)
+prov_points <- deso_2023 %>%
+  group_by(province) %>%
+  summarise(
+    median = median(net_sek, na.rm = TRUE),
+    mean   = mean(net_sek, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(province = factor(province, levels = prov_order))
+
+# 5) axis & labels
+lab_k <- scales::label_number(scale = 1/1000, suffix = "k")
+# trim global scale to reduce the “Stockholm stretch”; pin outliers at edges
+lim_swarm <- quantile(deso_2023$net_sek, c(0.01, 0.99), na.rm = TRUE)
+
+# 6) plot
+p_swarm <- ggplot(deso_2023, aes(x = net_sek, y = province)) +
+  # swarm of DeSO points
+  ggbeeswarm::geom_quasirandom(
+    groupOnX = TRUE, varwidth = TRUE,
+    size = 0.8, alpha = 0.35,
+    colour = "white", stroke = 0
+  ) +
+  # median  and mean overlays
+  geom_point(data = prov_points, aes(x = median, y = province, shape = "Median"),
+             size = 2.6, colour = "white", fill = NA, stroke = 0.9) +
+  geom_point(data = prov_points, aes(x = mean,   y = province, shape = "Mean"),
+             size = 2.6, colour = "white", stroke = 0.9) +
+  scale_shape_manual(
+    values = c("Mean" = 16, "Median" = 23),
+    name = NULL
+  ) +
+  scale_x_continuous(
+    labels = lab_k, limits = lim_swarm, oob = scales::squish,
+    expand = expansion(mult = c(0.02, 0.06))
+  ) +
+  labs(
+    title = "DeSO income distribution by province (2023)",
+    x = "Average Income (SEK)", y = "Province Name"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.background  = element_rect(fill = bg_dark, colour = NA),
+    panel.background = element_rect(fill = bg_dark, colour = NA),
+    text             = element_text(colour = "white"),
+    axis.text        = element_text(colour = "grey85"),
+    panel.grid.major = element_line(colour = "#2A2A2A"),
+    panel.grid.minor = element_blank(),
+    plot.title       = element_text(face = "bold"),
+    plot.subtitle    = element_text(colour = "grey80"),
+    legend.position  = "bottom"
+  )
+
+p_swarm
+
+```
+
+This Swarm visualization displays the distribution of average net income across all DeSO (Demographic Statistical Areas) within each Swedish province (län) for 2023. Each small dot represents one DeSO’s mean income, forming a “swarm” that illustrates both the spread and density of income levels across municipalities.
+
+The swarm chart used to avoids the distortion by plotting individual DeSO values, with 1st–99th percentile trimming to exclude extreme outliers.. This provides a more balanced view of intra-provincial distribution where even smaller provinces with wide internal gaps remain visible.
+
+Some noticeable pattern from the chart:
+
+- Stockholm stands out with both the highest average and median income, as well as a visibly wide internal spread. Stockholm has one of the highest outlier which need to be trimmed
+
+- Västra Götaland and Skåne also show relatively broad distributions, though less extreme, reflecting their mix of high-income urban centers (like Gothenburg and Malmö) and lower-income suburban or rural DeSO.
+
+- Northern provinces such as Norrbotten, Västerbotten, and Jämtland exhibit tighter, more compact swarms.
+
+This chart highlights the spatial income distribution dimension in Sweden’s: which geographically clustered around the three big urban regions, while most other provinces maintain a consistent middle-to-lower income. 
+
+---
+
+## Chart 3 — Within-City Variation: Inner City vs Suburbs
+
+```{r , echo = FALSE, fig.cap="Within-City Variation: Inner City vs Suburbs. The color shows the average income bin" , fig.height = 4}
+# ── Chart 3: City zooms aligned to Chart 1 palette + shared legend ─────────────
+
+# 1) extents (unchanged)
+kommun_bbox <- function(kod, buffer_m = 7000) {
+  kom <- deso_3006_simpl %>% dplyr::filter(kommunkod == kod) %>% sf::st_transform(3006)
+  bb  <- sf::st_as_sfc(sf::st_bbox(kom)) %>% sf::st_buffer(buffer_m) %>% sf::st_transform(4326)
+  bb
+}
+ext_malmo <- kommun_bbox("1280", 6000)
+ext_gbg   <- kommun_bbox("1480", 8000)
+ext_sthlm <- kommun_bbox("0180", 9000)
+
+crop_to <- function(sf_data, extent_poly) sf::st_crop(sf_data, sf::st_bbox(extent_poly))
+
+deso_malmo_viz <- crop_to(deso_all_2023_viz, ext_malmo)
+deso_gbg_viz   <- crop_to(deso_all_2023_viz, ext_gbg)
+deso_sthlm_viz <- crop_to(deso_all_2023_viz, ext_sthlm)
+
+# 2) city map theme (same dark background)
+map_theme_city <- theme_void() +
+  theme(
+    plot.background  = element_rect(fill = bg_dark, colour = NA),
+    panel.background = element_rect(fill = bg_dark, colour = NA),
+    plot.title       = element_text(size = 13, face = "bold", colour = "white", hjust = 0.5),
+    legend.position  = "bottom"
+  )
+
+# 3) city plot factory — IMPORTANT: do NOT suppress legend; reuse Chart 1 scale
+city_geom <- function(data, title){
+  ggplot(data) +
+    geom_sf(aes(fill = net_sek), colour = border, linewidth = 0.08) +
+    coord_sf(expand = TRUE, datum = NA) +
+    labs(title = title, fill = "Average net income (SEK)") +
+    map_theme_city
+}
+
+p_malmo <- city_geom(deso_malmo_viz, "Malmö")
+p_gbg   <- city_geom(deso_gbg_viz,   "Gothenburg")
+p_sthlm <- city_geom(deso_sthlm_viz, "Stockholm")
+
+# 4) assemble with the SAME scale as Chart 1 (fill_income), and collect legend
+final_city_maps <-
+  (p_malmo + p_gbg + p_sthlm) +
+  patchwork::plot_layout(ncol = 3, guides = "collect") &
+  fill_income &                                             # <- SAME palette/limits/labels as Chart 1
+  theme(
+    legend.position = "bottom",
+    legend.title    = element_text(colour = "white", size = 8.5),
+    legend.text     = element_text(colour = "grey85", size = 7)
+  )
+
+final_city_maps
+
+
+```
+
+The Map visualization above focuses on income distributions within Sweden’s three metropolitan areas: Stockholm, Gothenburg, and Malmö.
+
+By zooming into these urban regions, we able to get a more detailed view of local income variation and spatial inequality. Each dot on the map still represents a DeSO’s average net income (similarr to Figure 1), but here we can observe how income clusters within the city.
+
+Below are top 3 DeSO areas with the highest and lowest average incomes in each city.
+
+*Note : unfortunattely we could not get the DeSO name from the dataset, hence the name for each of the DeSO is KommunNamn*
+
+```{r, echo=FALSE}
+library(knitr)
+
+# how many to list
+N_TOP <- 3  # set to 5 if you prefer top/bottom 5
+
+# pretty SEK formatter: 350k, 412k, ...
+lab_k <- scales::label_number(scale = 1/1000, suffix = "k", big.mark = " ")
+
+# helper to generate top & bottom tables for one city
+make_city_tables <- function(sf_city, city_label) {
+  df <- sf::st_drop_geometry(sf_city) %>%
+    transmute(
+      DeSO = desokod,
+      `Kommun Name` = kommunnamn,
+      `Avg net income (SEK)` = net_sek
+    ) %>%
+    filter(!is.na(`Avg net income (SEK)`))
+
+  top_tbl <- df %>%
+    slice_max(`Avg net income (SEK)`, n = 3, with_ties = FALSE) %>%
+    mutate(`Avg net income (SEK)` = lab_k(`Avg net income (SEK)`))
+
+  bottom_tbl <- df %>%
+    slice_min(`Avg net income (SEK)`, n = 3, with_ties = FALSE) %>%
+    mutate(`Avg net income (SEK)` = lab_k(`Avg net income (SEK)`))
+
+  list(city = city_label, top = top_tbl, bottom = bottom_tbl)
+}
+
+# build tables for the three cities (uses your existing sf objects)
+tab_sthlm <- make_city_tables(deso_sthlm_viz, "Stockholm")
+tab_gbg   <- make_city_tables(deso_gbg_viz,   "Gothenburg")
+tab_malmo <- make_city_tables(deso_malmo_viz, "Malmö")
+```
+
+```{r, echo=FALSE}
+kable(tab_sthlm$top,    caption = "Stockholm highest DeSO by average net income (2023)")
+kable(tab_sthlm$bottom, caption = "Stockholm lowest DeSO by average net income (2023)")
+```
+**Stockholm**: 
+
+Stockholm show the sharpest internal income contrasts among Sweden’s cities (as we seen in Chart 2 section). The highest-income DeSO are concentrated in Danderyd and northern Stockholm.
+At the same time, several DeSO in southern and northwestern Stockholm display significantly lower average incomes.
+
+```{r, echo=FALSE}
+kable(tab_gbg$top,      caption = "Gothenburg highest DeSO by average net income (2023)")
+kable(tab_gbg$bottom,   caption = "Gothenburg lowest DeSO by average net income (2023)")
+```
+**Gothenburg**: 
+
+Gothenburg shows a moderate income distribution pattern. High-income DeSO are concentrated in central and coastal districts.
+Lower-income DeSO, in contrast, are found in the northern and northeastern parts of the municipality.
+
+```{r, echo=FALSE}
+kable(tab_malmo$top,    caption = "Malmö highest DeSO by average net income (2023)")
+kable(tab_malmo$bottom, caption = "Malmö lowest DeSO by average net income (2023)")
+```
+**Malmö**: 
+
+Malmö, despite its smaller size, displays a visible east–west divide. The highest-income DeSO include areas in East-North, while lower-income DeSO are located closer to eastern Malmö.
+The contrast is quite visible given Malmö’s small area.
+
+
+
+---
+
+## Chart 4 — Gender Differences in Income (2023)
+
+```{r, echo = FALSE, fig.cap="Gender differences in net income by province (2023). Each line connects female and male average income within a province." , fig.height = 5}
+
+library(tidyr)
+
+# 1) DeSO-by-sex table for 2023
+income_sex_2023 <- deso_income %>%
+  mutate(net_sek = if ("net_sek" %in% names(.)) net_sek else net_tkr * 1000) %>%
+  filter(year == YEAR_TO, sex %in% c("men","women","1","2")) %>%
+  mutate(sex = recode(sex, "1"="men", "2"="women", "Men"="men", "Women"="women"))
+
+# 2) Join län, aggregate to province means (per sex), compute diff & order
+sex_prov_2023 <- income_sex_2023 %>%
+  left_join(sf::st_drop_geometry(deso_3006_simpl)[, c("desokod","lanskod")], by = "desokod") %>%
+  left_join(lan_lookup, by = "lanskod") %>%
+  filter(!is.na(province)) %>%
+  group_by(province, sex) %>%
+  summarise(mean_net = mean(net_sek, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = sex, values_from = mean_net) %>%
+  mutate(
+    diff_sek = men - women,
+    overall  = (men + women) / 2
+  )
+
+# order provinces by overall average (high → low)
+sex_prov_2023 <- sex_prov_2023 %>%
+  arrange(desc(overall)) %>%
+  mutate(province = factor(province, levels = province))
+
+lab_k <- scales::label_number(scale = 1/1000, suffix = "k")
+
+# 3) Dumbbell chart
+p_gender <- ggplot(sex_prov_2023, aes(y = province)) +
+  geom_segment(aes(x = women, xend = men, yend = province),
+               colour = "grey70", linewidth = 0.9) +
+  geom_point(aes(x = women), colour = "#F8766D", size = 2.8) +  # women
+  geom_point(aes(x = men),    colour = "#00BFC4", size = 2.8) +  # men
+  # optional: label the gap at the right end
+  # geom_text(aes(x = pmax(men, women), label = lab_k(diff_sek)),
+  #           nudge_x = 8000, colour = "grey80", size = 3)
+  scale_x_continuous(labels = lab_k) +
+  labs(
+    title = "Gender differences in net income by province (2023)",
+    subtitle = "Each line connects female and male average income within a province.",
+    x = "Average income (SEK)", y = "Province Name"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.background  = element_rect(fill = bg_dark, colour = NA),
+    panel.background = element_rect(fill = bg_dark, colour = NA),
+    text             = element_text(colour = "white"),
+    axis.text        = element_text(colour = "grey85"),
+    panel.grid.major = element_line(colour = "#2A2A2A"),
+    panel.grid.minor = element_blank(),
+    plot.title       = element_text(face = "bold")
+  )
+
+p_gender
+```
+
+The figure above presents another perspective on income distribution, this time by gender. The data used here also include an average income breakdown by Male and Female at the DeSO level. The dumbbell chart above shows the difference of average net income between men and women for each province. 
+
+Overall, there is a noticeable variance between male and female incomes in every province — with men consistently earning higher average incomes.
+
+From the chart, we can observe that while both men and women in Stockholm have the highest average incomes, the gender gap is also widest there.
+In contrast, Gotland shows the smallest gap, indicating a relatively more balanced income distribution between men and women.
+
+As a note, the income is net income average per DeSO, hence the real average income per gender could be different if we see as whole data per province. 
+
+
+---
+
+# Conclusion
+
+
+- **Highest income region:** Stockholm stands out as the wealthiest region in Sweden, with the highest average net income per DeSO.  
+- **Urban vs suburban patterns:** Inner-city areas and some coastal suburbs consistently show higher income levels, while suburban and rural regions tend to cluster in the lower-income range.  
+- **Gender disparities:** Across all provinces, men earn more than women on average. The widest gaps observed in Stockholm.  
+
+Overall, the analysis highlights general overview of the Sweden's income distribution by location. It will be interesting to do more deep-dive analysis combining the demographic of each of the DeSO to get more insights.
+
+\pagebreak
+
+# Statement of AI Use
+Parts of this project were developed with assistance from LLM-ChatGPT.  
+The tool was used primarily to help me understand the structure and metadata of the DeSO dataset, Sweden Province-Municipality definitions, debug the error in visualization and asking for a consistent color palette and layout suggestion.  
+
+All data selection, visualization, analytical interpretation, and narrative content are entirely my own work.
